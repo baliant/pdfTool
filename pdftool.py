@@ -14,11 +14,19 @@ except Exception:
     _HAVE_YAML = False
 
 
-icon_path = Path(__file__).parent / "koru_logo.png"
+icon_path = Path(__file__).parent / "icon" / "koru_logo.png"
 if icon_path.exists():
-    st.set_page_config(page_title="PDF Select & Merge", page_icon=icon_path, layout="wide")
+    st.set_page_config(
+        page_title="PDF Select & Merge",
+        page_icon=icon_path,
+        layout="wide"
+    )
 else:
-    st.set_page_config(page_title="PDF Select & Merge", page_icon="📚", layout="wide")
+    st.set_page_config(
+        page_title="PDF Select & Merge",
+        page_icon="📚",
+        layout="wide"
+    )
 
 
 def open_reader_from_bytes(data: bytes):
