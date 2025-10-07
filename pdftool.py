@@ -107,7 +107,7 @@ def load_selection_mapping(data: bytes, suffix: str):
 
 
 st.title("📚 PDF Select & Merge")
-st.caption("List page counts, pick pages per file, merge, and download. (1-based page numbering)")
+st.caption("List page counts, pick pages per file, merge, and download.")
 
 
 with st.expander("Page selection syntax help"):
@@ -270,3 +270,20 @@ if file_entries and selections:
         st.download_button("Download merged PDF", data=bio, file_name=out_name, mime="application/pdf")
 else:
     st.info("Add files and valid page selections to enable merging.")
+
+
+# Export selection
+if file_entries and selections:
+    # Build a dict with the exact specs the user typed
+    mapping_out = {name: ",".join(map(str, pages)) for name, pages in selections.items()}
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("Export mapping (YAML)"):
+            yaml_bytes = yaml.safe_dump(mapping_out, allow_unicode=True).encode("utf-8")
+            st.download_button("Download selections.yaml", data=yaml_bytes,
+                               file_name="selections.yaml", mime="text/yaml")
+    with col2:
+        json_bytes = json.dumps(mapping_out, ensure_ascii=False, indent=2).encode("utf-8")
+        st.download_button("Download selections.json", data=json_bytes,
+                           file_name="selections.json", mime="application/json")
+
