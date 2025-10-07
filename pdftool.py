@@ -14,7 +14,7 @@ except Exception:
     _HAVE_YAML = False
 
 
-icon_url = 📚
+icon_url = "https://raw.githubusercontent.com/baliant/pdftool/main/icon/koru_logo.png"
 
 st.set_page_config(
     page_title="PDF Select & Merge",
