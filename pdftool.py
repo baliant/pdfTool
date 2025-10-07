@@ -165,7 +165,7 @@ def embed_pdf_viewer(data: bytes, height: int = 480):
 
 
 st.title("📚 PDF Select, Review & Merge")
-st.caption("List page counts, visually review pages, pick ranges, merge, and download. (1-based page numbering)")
+st.caption("List page counts, visually review pages, pick ranges, merge, and download.")
 
 with st.expander("Page selection syntax help"):
     st.markdown(
