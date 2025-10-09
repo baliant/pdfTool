@@ -164,15 +164,21 @@ def embed_pdf_viewer(data: bytes, height: int = 480):
 
 
 def page_selector(label: str, pages: int, key: str):
-    """Safe page picker that avoids Streamlit slider errors on empty PDFs."""
+    """Safe page picker: slider for ≥2 pages, number_input for 1 page, skip for 0."""
     try:
         pages = int(pages)
     except Exception:
         pages = 0
+
     if pages < 1:
         st.warning("This PDF appears to have no pages (cannot preview).")
         return None
-    # value must be within [1, pages]
+
+    if pages == 1:
+        st.caption("This PDF has 1 page.")
+        return st.number_input(label, min_value=1, max_value=1, value=1, step=1, key=key)
+
+    # pages >= 2 → slider is fine
     return st.slider(label, min_value=1, max_value=pages, value=1, step=1, key=key)
 
 
