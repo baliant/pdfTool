@@ -2,11 +2,11 @@ import io
 import json
 import base64
 from pathlib import Path
-from typing import Dict, List, Union, Tuple
+from typing import Dict, List, Union, Tuple, Optional
 
 import streamlit as st
 from pypdf import PdfReader, PdfWriter
-from pypdf.errors import PdfReadError
+from pypdf.errors import PdfReadError, DependencyError  # <-- important
 
 # Optional YAML for presets
 try:
@@ -31,22 +31,50 @@ st.set_page_config(
     layout="wide",
 )
 
+CRYPTO_HINT = (
+    "Decryption requires a crypto backend. Install one of:\n"
+    "`pip install cryptography`  (recommended)\n"
+    "or `pip install pycryptodome`"
+)
 
 # ---------- Helpers ----------
-def open_reader_from_bytes(data: bytes):
+def try_open_reader(data: bytes) -> Optional[PdfReader]:
+    """Open a PdfReader safely (no page access), return None on hard failure."""
     try:
         bio = io.BytesIO(data)
         reader = PdfReader(bio)
-        if reader.is_encrypted:
-            try:
-                reader.decrypt("")
-            except Exception:
-                st.warning("Encrypted PDF that cannot be opened with an empty password. Skipping.")
-                return None
         return reader
     except (PdfReadError, OSError) as e:
         st.warning(f"Cannot open PDF: {e}")
         return None
+
+
+def try_decrypt_reader(reader: PdfReader, password: str) -> bool:
+    """Attempt to decrypt. Returns True if unlocked. Surfaces crypto dependency issues nicely."""
+    try:
+        # pypdf returns int or bool across versions; treat >0 / True as success
+        res = reader.decrypt(password)
+        return bool(res)
+    except DependencyError:
+        st.error(f"Cannot decrypt: crypto backend missing.\n\n{CRYPTO_HINT}")
+        return False
+    except Exception as e:
+        # Wrong password or other error
+        st.warning(f"Failed to decrypt with the provided password: {e}")
+        return False
+
+
+def get_num_pages_safe(reader: PdfReader) -> int:
+    """Return page count, guarding against encryption/crypto issues."""
+    try:
+        return len(reader.pages)
+    except DependencyError:
+        # Happens if the file is encrypted and crypto backend is missing
+        st.error(f"Cannot read pages (crypto backend missing).\n\n{CRYPTO_HINT}")
+        return 0
+    except Exception as e:
+        st.warning(f"Could not read page count: {e}")
+        return 0
 
 
 def parse_one_pagespec(token: str, max_pages: int) -> List[int]:
@@ -184,7 +212,7 @@ def page_selector(label: str, pages: int, key: str):
 
 # ---------- UI ----------
 st.title("📚 PDF Select, Review & Merge")
-st.caption("List page counts, visually review pages, pick ranges, merge, and download.")
+st.caption("Handles encrypted PDFs (with password), page previews, flexible selections, and merging.")
 
 with st.expander("Page selection syntax help"):
     st.markdown(
@@ -203,6 +231,7 @@ tab_upload, tab_folder, tab_review = st.tabs(["📤 Upload PDFs", "📁 Folder p
 
 selections: Dict[str, List[int]] = {}
 file_entries: List[Tuple[str, bytes]] = []  # (display_name, data_bytes)
+passwords: Dict[str, str] = {}              # per-file password cache (name/path -> password)
 
 
 # ----- Upload Tab -----
@@ -220,11 +249,40 @@ with tab_upload:
         st.subheader("Files")
         for f in uploaded:
             data = f.getvalue()
-            reader = open_reader_from_bytes(data)
+            reader = try_open_reader(data)
             if not reader:
                 continue
-            pages = len(reader.pages)
 
+            # ---- Encrypted handling
+            pw_key = _unique_key("pw", f.name, data)
+            if reader.is_encrypted:
+                st.info(f"🔒 {f.name} is encrypted.")
+                # try empty password first (some PDFs use empty user password)
+                unlocked = False
+                try:
+                    unlocked = bool(reader.decrypt(""))
+                except DependencyError:
+                    st.error(f"{CRYPTO_HINT}")
+                except Exception:
+                    unlocked = False
+                # ask for password if still locked
+                if not unlocked:
+                    pw = st.text_input(f"Password for {f.name}", type="password", key=pw_key)
+                    if pw:
+                        unlocked = try_decrypt_reader(reader, pw)
+                        if unlocked:
+                            passwords[f.name] = pw
+                if not unlocked:
+                    st.warning("Locked: cannot show page count/preview until decrypted.")
+                    # Allow mapping entry but skip preview/count
+                    default_spec = uploaded_mapping.get(f.name, "all") if uploaded_mapping else "all"
+                    spec_key = _unique_key("spec", f.name, data)
+                    spec = st.text_input(f"Pages for {f.name}", value=str(default_spec), key=spec_key)
+                    # Don't append file_entries yet because we can't know pages/validate
+                    continue  # proceed to next file
+
+            # ---- Now safe to access pages
+            pages = get_num_pages_safe(reader)
             left, right = st.columns([2, 1])
             with left:
                 st.markdown(f"**{f.name}** — {pages} pages")
@@ -293,10 +351,35 @@ with tab_folder:
                     except Exception as e:
                         st.warning(f"Cannot read {pf}: {e}")
                         continue
-                    reader = open_reader_from_bytes(data)
+                    reader = try_open_reader(data)
                     if not reader:
                         continue
-                    pages = len(reader.pages)
+
+                    # Encrypted handling
+                    pw_key = _unique_key("pw", str(pf))
+                    if reader.is_encrypted:
+                        st.info(f"🔒 {pf.name} is encrypted.")
+                        unlocked = False
+                        try:
+                            unlocked = bool(reader.decrypt(""))
+                        except DependencyError:
+                            st.error(f"{CRYPTO_HINT}")
+                        except Exception:
+                            unlocked = False
+                        if not unlocked:
+                            pw = st.text_input(f"Password for {pf}", type="password", key=pw_key)
+                            if pw:
+                                unlocked = try_decrypt_reader(reader, pw)
+                                if unlocked:
+                                    passwords[str(pf)] = pw
+                        if not unlocked:
+                            st.warning("Locked: cannot show page count/preview until decrypted.")
+                            default_spec = folder_mapping.get(str(pf), folder_mapping.get(pf.name, "all")) if folder_mapping else "all"
+                            spec_key = _unique_key("spec", str(pf))
+                            st.text_input(f"Pages for {pf}", value=str(default_spec), key=spec_key)
+                            continue
+
+                    pages = get_num_pages_safe(reader)
                     st.markdown(f"**{pf}** — {pages} pages")
                     default_spec = "all"
                     if folder_mapping:
@@ -325,10 +408,25 @@ with tab_review:
     else:
         for name, data in file_entries:
             with st.expander(f"🔍 {Path(name).name}"):
-                reader = open_reader_from_bytes(data)
+                reader = try_open_reader(data)
                 if not reader:
                     continue
-                pages = len(reader.pages)
+
+                # If encrypted, try to unlock using cached password (if any)
+                if reader.is_encrypted:
+                    pw = passwords.get(name, "")
+                    ok = False
+                    try:
+                        ok = bool(reader.decrypt(pw))
+                    except DependencyError:
+                        st.error(f"{CRYPTO_HINT}")
+                    except Exception:
+                        ok = False
+                    if not ok:
+                        st.warning("Locked: enter password in the Upload/Folder tab to enable preview.")
+                        continue
+
+                pages = get_num_pages_safe(reader)
                 if not _HAVE_FITZ:
                     st.info("Install **PyMuPDF** (`pip install pymupdf`) to enable page previews.")
                 else:
@@ -341,16 +439,9 @@ with tab_review:
                             if png:
                                 st.image(png, caption=f"{Path(name).name} — Page {pnum}", use_column_width=True)
                     with c2:
-                        st.write("Quick jump")
-                        jump_key = _unique_key("jump", name, data)
-                        if pnum is not None:
-                            jump = st.text_input(f"Go to page (1..{pages})", value="", key=jump_key)
-                            if jump.strip().isdigit():
-                                j = int(jump)
-                                if 1 <= j <= pages:
-                                    st.session_state[slider_key] = j
+                        st.write("Inline viewer")
                         viewer_key = _unique_key("viewer2", name, data)
-                        show_full = st.checkbox("Inline full PDF viewer", value=False, key=viewer_key)
+                        show_full = st.checkbox("Show full PDF", value=False, key=viewer_key)
                         if show_full:
                             embed_pdf_viewer(data, height=450)
 
@@ -373,10 +464,30 @@ if file_entries and selections:
     if st.button("Merge PDFs"):
         writer = PdfWriter()
         for name, data in file_entries:
-            reader = open_reader_from_bytes(data)
+            reader = try_open_reader(data)
             if not reader:
                 continue
-            maxp = len(reader.pages)
+
+            # Unlock with cached password if needed
+            if reader.is_encrypted:
+                pw = passwords.get(name, "")
+                ok = False
+                try:
+                    ok = bool(reader.decrypt(pw))
+                except DependencyError:
+                    st.error(f"{CRYPTO_HINT}")
+                    continue
+                except Exception:
+                    ok = False
+                if not ok:
+                    st.warning(f"Skipping encrypted file '{name}' (no/invalid password).")
+                    continue
+
+            maxp = get_num_pages_safe(reader)
+            if maxp < 1:
+                st.warning(f"Skipping '{name}' — no readable pages.")
+                continue
+
             wanted = selections.get(name, list(range(1, maxp + 1)))
             if add_bookmarks and wanted:
                 try:
