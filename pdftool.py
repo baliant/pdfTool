@@ -8,14 +8,14 @@ import streamlit as st
 from pypdf import PdfReader, PdfWriter
 from pypdf.errors import PdfReadError
 
-# YAML for presets
+# Optional YAML for presets
 try:
     import yaml  # type: ignore
     _HAVE_YAML = True
 except Exception:
     _HAVE_YAML = False
 
-# PyMuPDF for fast page previews
+# Optional PyMuPDF for fast page previews (thumbnails)
 try:
     import fitz  # PyMuPDF
     _HAVE_FITZ = True
@@ -28,10 +28,11 @@ ICON_URL = "https://raw.githubusercontent.com/baliant/pdftool/main/icon/koru_log
 st.set_page_config(
     page_title="PDF Select, Review & Merge",
     page_icon=ICON_URL,
-    layout="wide"
+    layout="wide",
 )
 
 
+# ---------- Helpers ----------
 def open_reader_from_bytes(data: bytes):
     try:
         bio = io.BytesIO(data)
@@ -135,9 +136,7 @@ def _load_doc_for_preview(data: bytes):
 
 
 def render_page_image(data: bytes, page_index0: int, zoom: float = 1.5) -> Union[None, bytes]:
-    """
-    Render one page to PNG. Returns PNG bytes or None.
-    """
+    """Render one page to PNG. Returns PNG bytes or None."""
     if not _HAVE_FITZ:
         return None
     doc = _load_doc_for_preview(data)
@@ -164,6 +163,20 @@ def embed_pdf_viewer(data: bytes, height: int = 480):
     )
 
 
+def page_selector(label: str, pages: int, key: str):
+    """Safe page picker that avoids Streamlit slider errors on empty PDFs."""
+    try:
+        pages = int(pages)
+    except Exception:
+        pages = 0
+    if pages < 1:
+        st.warning("This PDF appears to have no pages (cannot preview).")
+        return None
+    # value must be within [1, pages]
+    return st.slider(label, min_value=1, max_value=pages, value=1, step=1, key=key)
+
+
+# ---------- UI ----------
 st.title("📚 PDF Select, Review & Merge")
 st.caption("List page counts, visually review pages, pick ranges, merge, and download.")
 
@@ -183,13 +196,13 @@ with st.expander("Page selection syntax help"):
 tab_upload, tab_folder, tab_review = st.tabs(["📤 Upload PDFs", "📁 Folder path (local run)", "🧐 Review"])
 
 selections: Dict[str, List[int]] = {}
-file_entries: List[Tuple[str, bytes]] = []  # list of tuples: (display_name, data_bytes)
+file_entries: List[Tuple[str, bytes]] = []  # (display_name, data_bytes)
 
 
-# ---------------- Upload Tab ----------------
+# ----- Upload Tab -----
 with tab_upload:
     uploaded = st.file_uploader("Select one or more PDFs", type=["pdf"], accept_multiple_files=True)
-    mapping_file = st.file_uploader("Optional selections mapping (YAML or JSON)", type=["yaml","yml","json"], key="map_upload")
+    mapping_file = st.file_uploader("Optional selections mapping (YAML or JSON)", type=["yaml", "yml", "json"], key="map_upload")
     uploaded_mapping = {}
     if mapping_file is not None:
         try:
@@ -206,25 +219,24 @@ with tab_upload:
                 continue
             pages = len(reader.pages)
 
-            left, right = st.columns([2,1])
+            left, right = st.columns([2, 1])
             with left:
                 st.markdown(f"**{f.name}** — {pages} pages")
-                default_spec = "all"
-                if uploaded_mapping:
-                    default_spec = uploaded_mapping.get(f.name, default_spec)
+                default_spec = uploaded_mapping.get(f.name, "all") if uploaded_mapping else "all"
                 spec_key = _unique_key("spec", f.name, data)
                 spec = st.text_input(f"Pages for {f.name}", value=str(default_spec), key=spec_key)
 
-                # --- Review controls (per file) ---
+                # Review controls
                 with st.expander("Review this PDF"):
                     if not _HAVE_FITZ:
                         st.info("Install **PyMuPDF** (`pip install pymupdf`) to enable page previews.")
                     else:
                         pnum_key = _unique_key("prev", f.name, data)
-                        pnum = st.number_input("Preview page", min_value=1, max_value=pages, value=1, step=1, key=pnum_key)
-                        png = render_page_image(data, int(pnum)-1, zoom=1.5)
-                        if png:
-                            st.image(png, caption=f"{f.name} — Page {pnum}", use_column_width=True)
+                        pnum = page_selector("Preview page", pages, key=pnum_key)
+                        if pnum is not None:
+                            png = render_page_image(data, int(pnum) - 1, zoom=1.5)
+                            if png:
+                                st.image(png, caption=f"{f.name} — Page {pnum}", use_column_width=True)
                         show_full_key = _unique_key("viewer", f.name, data)
                         show_full = st.checkbox("Inline full PDF viewer", value=False, key=show_full_key)
                         if show_full:
@@ -238,7 +250,6 @@ with tab_upload:
                         st.warning("No valid pages; this file will be skipped.")
                     else:
                         st.caption(f"Selected pages: {len(pages_list)}")
-                        # Show first 10 indices for quick glance
                         s = ", ".join(map(str, pages_list[:10]))
                         more = "" if len(pages_list) <= 10 else " …"
                         st.text(f"{s}{more}")
@@ -248,11 +259,11 @@ with tab_upload:
                     st.error(f"Invalid page spec for {f.name}: {e}")
 
 
-# ---------------- Folder Tab ----------------
+# ----- Folder Tab -----
 with tab_folder:
     st.write("Enter a local folder path to scan for PDFs. (This only works when you run Streamlit locally.)")
     folder = st.text_input("Folder path", value="")
-    mapping2 = st.file_uploader("Optional selections mapping (YAML or JSON)", type=["yaml","yml","json"], key="map_folder")
+    mapping2 = st.file_uploader("Optional selections mapping (YAML or JSON)", type=["yaml", "yml", "json"], key="map_folder")
     folder_mapping = {}
     if mapping2 is not None:
         try:
@@ -300,7 +311,7 @@ with tab_folder:
                         st.error(f"Invalid page spec for {pf}: {e}")
 
 
-# ---------------- Global Review Tab ----------------
+# ----- Global Review Tab -----
 with tab_review:
     st.write("Preview uploaded or scanned PDFs. Use the controls to flip pages and verify content before merging.")
     if not file_entries:
@@ -315,31 +326,34 @@ with tab_review:
                 if not _HAVE_FITZ:
                     st.info("Install **PyMuPDF** (`pip install pymupdf`) to enable page previews.")
                 else:
-                    c1, c2 = st.columns([3,2])
+                    c1, c2 = st.columns([3, 2])
                     with c1:
                         slider_key = _unique_key("slider", name, data)
-                        pnum = st.slider(f"Page for {Path(name).name}", 1, pages, 1, key=slider_key)
-                        png = render_page_image(data, int(pnum)-1, zoom=1.5)
-                        if png:
-                            st.image(png, caption=f"{Path(name).name} — Page {pnum}", use_column_width=True)
+                        pnum = page_selector(f"Page for {Path(name).name}", pages, key=slider_key)
+                        if pnum is not None:
+                            png = render_page_image(data, int(pnum) - 1, zoom=1.5)
+                            if png:
+                                st.image(png, caption=f"{Path(name).name} — Page {pnum}", use_column_width=True)
                     with c2:
                         st.write("Quick jump")
                         jump_key = _unique_key("jump", name, data)
-                        jump = st.text_input(f"Go to page (1..{pages})", value="", key=jump_key)
-                        if jump.strip().isdigit():
-                            j = int(jump)
-                            if 1 <= j <= pages:
-                                st.session_state[slider_key] = j
+                        if pnum is not None:
+                            jump = st.text_input(f"Go to page (1..{pages})", value="", key=jump_key)
+                            if jump.strip().isdigit():
+                                j = int(jump)
+                                if 1 <= j <= pages:
+                                    st.session_state[slider_key] = j
                         viewer_key = _unique_key("viewer2", name, data)
                         show_full = st.checkbox("Inline full PDF viewer", value=False, key=viewer_key)
                         if show_full:
                             embed_pdf_viewer(data, height=450)
 
 
+# ----- Merge -----
 st.markdown("---")
 st.subheader("Merge")
 
-colA, colB, colC = st.columns([2,1,1])
+colA, colB, colC = st.columns([2, 1, 1])
 with colA:
     out_name = st.text_input("Output file name", value="merged.pdf")
 with colB:
@@ -350,7 +364,6 @@ with colC:
 if file_entries and selections:
     if keep_file_order == "Alphabetical by name":
         file_entries = sorted(file_entries, key=lambda t: Path(t[0]).name.lower())
-    # Build merged PDF
     if st.button("Merge PDFs"):
         writer = PdfWriter()
         for name, data in file_entries:
@@ -361,7 +374,6 @@ if file_entries and selections:
             wanted = selections.get(name, list(range(1, maxp + 1)))
             if add_bookmarks and wanted:
                 try:
-                    # Bookmark to first added page for this file
                     start_idx = len(writer.pages)
                     if hasattr(writer, "add_outline_item"):
                         writer.add_outline_item(Path(name).name, start_idx)
@@ -377,14 +389,13 @@ if file_entries and selections:
         bio = io.BytesIO()
         writer.write(bio)
         bio.seek(0)
-
         st.success(f"Merged {len(file_entries)} file(s) into '{out_name}'.")
         st.download_button("Download merged PDF", data=bio, file_name=out_name, mime="application/pdf")
 else:
     st.info("Add files and valid page selections to enable merging.")
 
 
-# Export selection (unchanged but with safe guards)
+# ----- Export selections -----
 if file_entries and selections:
     mapping_out = {name: ",".join(map(str, pages)) for name, pages in selections.items()}
     col1, col2 = st.columns(2)
