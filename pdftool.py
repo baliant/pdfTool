@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Dict, List, Union, Tuple, Optional
 
 import streamlit as st
+import pandas as pd
 from pypdf import PdfReader, PdfWriter
 from pypdf.errors import PdfReadError, DependencyError  # <-- important
 
@@ -278,7 +279,12 @@ with tab_upload:
                     default_spec = uploaded_mapping.get(f.name, "all") if uploaded_mapping else "all"
                     spec_key = _unique_key("spec", f.name, data)
                     spec = st.text_input(f"Pages for {f.name}", value=str(default_spec), key=spec_key)
-                    # Don't append file_entries yet because we can't know pages/validate
+                    # here we still try to keep a spec (will be validated later in table)
+                    try:
+                        selections[f.name] = parse_pagespec(spec, 999999)  # dummy max, will be fixed later
+                    except Exception:
+                        pass
+                    file_entries.append((f.name, data))
                     continue  # proceed to next file
 
             # ---- Now safe to access pages
@@ -376,7 +382,12 @@ with tab_folder:
                             st.warning("Locked: cannot show page count/preview until decrypted.")
                             default_spec = folder_mapping.get(str(pf), folder_mapping.get(pf.name, "all")) if folder_mapping else "all"
                             spec_key = _unique_key("spec", str(pf))
-                            st.text_input(f"Pages for {pf}", value=str(default_spec), key=spec_key)
+                            spec = st.text_input(f"Pages for {pf}", value=str(default_spec), key=spec_key)
+                            try:
+                                selections[str(pf)] = parse_pagespec(spec, 999999)
+                            except Exception:
+                                pass
+                            file_entries.append((str(pf), data))
                             continue
 
                     pages = get_num_pages_safe(reader)
@@ -444,6 +455,96 @@ with tab_review:
                         show_full = st.checkbox("Show full PDF", value=False, key=viewer_key)
                         if show_full:
                             embed_pdf_viewer(data, height=450)
+
+
+# ----- Tabular page selection UI -----
+st.markdown("---")
+st.markdown("### Page selections (table view)")
+
+if file_entries:
+    rows = []
+    # Build rows using current selections and page counts
+    for name, data in file_entries:
+        reader = try_open_reader(data)
+        if not reader:
+            continue
+
+        # Handle encryption with cached passwords
+        if reader.is_encrypted:
+            pw = passwords.get(name, "")
+            ok = False
+            try:
+                ok = bool(reader.decrypt(pw))
+            except DependencyError:
+                st.error(CRYPTO_HINT)
+            except Exception:
+                ok = False
+            if not ok:
+                st.warning(f"Locked: cannot compute page count for '{name}'.")
+                continue
+
+        max_pages = get_num_pages_safe(reader)
+
+        # Current selection -> string
+        if name in selections and selections[name]:
+            # simple version: comma separated list
+            spec_str = ",".join(str(p) for p in selections[name])
+        else:
+            spec_str = "all"
+
+        rows.append({
+            "PDF Name": Path(name).name,
+            "Key": name,  # internal identifier
+            "Pages to be printed": spec_str,
+            "Sum pages": max_pages,
+        })
+
+    if rows:
+        df = pd.DataFrame(rows)
+
+        edited_df = st.data_editor(
+            df,
+            num_rows="fixed",
+            hide_index=True,
+            key="selection_table",
+            column_config={
+                "Key": None,  # hide technical column
+                "PDF Name": st.column_config.TextColumn(disabled=True),
+                "Pages to be printed": st.column_config.TextColumn(
+                    help="Use syntax: 1,3-5,all,-3,4-",
+                ),
+                "Sum pages": st.column_config.NumberColumn(disabled=True),
+            },
+        )
+
+        if st.button("Apply table selections"):
+            new_selections: Dict[str, List[int]] = {}
+            had_error = False
+            for _, row in edited_df.iterrows():
+                key = row["Key"]
+                maxp = int(row["Sum pages"])
+                spec = str(row["Pages to be printed"])
+                try:
+                    pages_list = parse_pagespec(spec, maxp)
+                    if not pages_list:
+                        st.warning(
+                            f"No valid pages for '{row['PDF Name']}'. "
+                            "This file will be skipped unless you adjust the spec."
+                        )
+                    new_selections[key] = pages_list
+                except Exception as e:
+                    st.error(f"Invalid page spec for {row['PDF Name']}: {e}")
+                    had_error = True
+                    break
+
+            if not had_error:
+                selections.clear()
+                selections.update(new_selections)
+                st.success("Selections updated from table.")
+    else:
+        st.info("No readable PDFs to show in table.")
+else:
+    st.info("No files loaded yet. Upload or select a folder first.")
 
 
 # ----- Merge -----
