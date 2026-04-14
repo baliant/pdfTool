@@ -7,7 +7,7 @@ from typing import Dict, List, Union, Tuple, Optional
 import streamlit as st
 import pandas as pd
 from pypdf import PdfReader, PdfWriter
-from pypdf.errors import PdfReadError, DependencyError  # <-- important
+from pypdf.errors import PdfReadError, DependencyError
 
 # Optional YAML for presets
 try:
@@ -16,7 +16,7 @@ try:
 except Exception:
     _HAVE_YAML = False
 
-# Optional PyMuPDF for fast page previews (thumbnails)
+# Optional PyMuPDF for fast page previews (thumbnails) + robust signed PDF handling
 try:
     import fitz  # PyMuPDF
     _HAVE_FITZ = True
@@ -38,12 +38,13 @@ CRYPTO_HINT = (
     "or `pip install pycryptodome`"
 )
 
+
 # ---------- Helpers ----------
 def try_open_reader(data: bytes) -> Optional[PdfReader]:
     """Open a PdfReader safely (no page access), return None on hard failure."""
     try:
         bio = io.BytesIO(data)
-        reader = PdfReader(bio)
+        reader = PdfReader(bio, strict=False)
         return reader
     except (PdfReadError, OSError) as e:
         st.warning(f"Cannot open PDF: {e}")
@@ -51,16 +52,22 @@ def try_open_reader(data: bytes) -> Optional[PdfReader]:
 
 
 def try_decrypt_reader(reader: PdfReader, password: str) -> bool:
-    """Attempt to decrypt. Returns True if unlocked. Surfaces crypto dependency issues nicely."""
+    """Attempt to decrypt. Returns True if unlocked."""
     try:
-        # pypdf returns int or bool across versions; treat >0 / True as success
         res = reader.decrypt(password)
-        return bool(res)
+        if not bool(res):
+            return False
+
+        # Force at least some real access
+        _ = len(reader.pages)
+        if len(reader.pages) > 0:
+            _ = reader.pages[0]
+        return True
+
     except DependencyError:
         st.error(f"Cannot decrypt: crypto backend missing.\n\n{CRYPTO_HINT}")
         return False
     except Exception as e:
-        # Wrong password or other error
         st.warning(f"Failed to decrypt with the provided password: {e}")
         return False
 
@@ -70,12 +77,168 @@ def get_num_pages_safe(reader: PdfReader) -> int:
     try:
         return len(reader.pages)
     except DependencyError:
-        # Happens if the file is encrypted and crypto backend is missing
         st.error(f"Cannot read pages (crypto backend missing).\n\n{CRYPTO_HINT}")
         return 0
     except Exception as e:
         st.warning(f"Could not read page count: {e}")
         return 0
+
+
+def is_probably_signed_pdf(data: bytes) -> bool:
+    """Best-effort detection for signed / certified PDFs."""
+    # Try PyMuPDF first
+    if _HAVE_FITZ:
+        try:
+            doc = fitz.open(stream=data, filetype="pdf")
+            try:
+                # hasattr/getattr for version tolerance
+                if bool(getattr(doc, "has_signatures", False)):
+                    return True
+            finally:
+                doc.close()
+        except Exception:
+            pass
+
+    # Fallback: inspect AcroForm / signature-like form structure with pypdf
+    reader = try_open_reader(data)
+    if not reader:
+        return False
+
+    try:
+        root = reader.trailer.get("/Root", {})
+        acro = root.get("/AcroForm")
+        if acro:
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
+def flatten_pdf_with_fitz(data: bytes, password: str = "") -> bytes:
+    """
+    Create a clean working copy with PyMuPDF.
+    Intended for merge/print workflows, not signature preservation.
+    """
+    if not _HAVE_FITZ:
+        raise RuntimeError("PyMuPDF is not available.")
+
+    doc = fitz.open(stream=data, filetype="pdf")
+    try:
+        needs_pass = False
+        try:
+            needs_pass = bool(getattr(doc, "needs_pass", False))
+        except Exception:
+            needs_pass = False
+
+        if needs_pass:
+            if not password:
+                raise ValueError("Password required for secured PDF.")
+            ok = doc.authenticate(password)
+            if not ok:
+                raise ValueError("Invalid password for secured PDF.")
+
+        # Save as a fresh PDF byte stream.
+        # This is usually much more merge-friendly for signed/certified PDFs.
+        return doc.tobytes(garbage=3, deflate=True)
+    finally:
+        doc.close()
+
+
+def normalize_pdf_for_merge(data: bytes, password: str = "") -> bytes:
+    """
+    Return merge-friendly PDF bytes.
+    For signed/encrypted/problematic PDFs, try to create a clean working copy first.
+    """
+    reader = try_open_reader(data)
+    if not reader:
+        raise ValueError("Cannot open PDF.")
+
+    should_normalize = False
+    if reader.is_encrypted:
+        should_normalize = True
+    elif is_probably_signed_pdf(data):
+        should_normalize = True
+
+    if not should_normalize:
+        return data
+
+    # Prefer PyMuPDF for better resilience on Adobe-signed files
+    if _HAVE_FITZ:
+        return flatten_pdf_with_fitz(data, password=password)
+
+    # Fallback if fitz is unavailable: try pypdf rewrite
+    try:
+        if reader.is_encrypted:
+            ok = bool(reader.decrypt(password))
+            if not ok:
+                raise ValueError("Invalid password for encrypted PDF.")
+
+        tmp_writer = PdfWriter()
+        for page in reader.pages:
+            tmp_writer.add_page(page)
+
+        out = io.BytesIO()
+        tmp_writer.write(out)
+        out.seek(0)
+        return out.getvalue()
+
+    except DependencyError:
+        raise
+    except Exception as e:
+        raise ValueError(f"Could not prepare PDF for merge: {e}")
+
+
+def prepare_reader_for_merge(name: str, data: bytes, password: str = "") -> Tuple[Optional[PdfReader], Optional[str]]:
+    """
+    Returns a merge-ready PdfReader and an optional note message.
+    May create a working copy for signed/certified/encrypted PDFs.
+    """
+    original_reader = try_open_reader(data)
+    if not original_reader:
+        return None, f"Skipping '{Path(name).name}' — cannot open PDF."
+
+    needs_working_copy = False
+    note = None
+
+    try:
+        if original_reader.is_encrypted:
+            needs_working_copy = True
+            note = f"'{Path(name).name}' is encrypted/secured. Preparing working copy for merge."
+        elif is_probably_signed_pdf(data):
+            needs_working_copy = True
+            note = f"'{Path(name).name}' appears to be signed/certified. Preparing working copy for merge."
+    except Exception:
+        pass
+
+    if not needs_working_copy:
+        return original_reader, None
+
+    try:
+        merge_data = normalize_pdf_for_merge(data, password=password)
+        merge_reader = try_open_reader(merge_data)
+        if not merge_reader:
+            return None, f"Skipping '{Path(name).name}' — cannot reopen prepared PDF."
+
+        # If still encrypted for some reason, try decrypt once more
+        if merge_reader.is_encrypted:
+            ok = False
+            try:
+                ok = bool(merge_reader.decrypt(password))
+            except DependencyError:
+                raise
+            except Exception:
+                ok = False
+
+            if not ok:
+                return None, f"Skipping '{Path(name).name}' — prepared PDF still needs a valid password."
+
+        return merge_reader, note
+
+    except DependencyError:
+        raise
+    except Exception as e:
+        return None, f"Skipping '{Path(name).name}' — cannot prepare for merge: {e}"
 
 
 def parse_one_pagespec(token: str, max_pages: int) -> List[int]:
@@ -121,9 +284,11 @@ def parse_pagespec(spec: Union[str, List[str]], max_pages: int) -> List[int]:
         parts = [p for p in spec.split(",") if p.strip()]
     else:
         parts = list(spec)
+
     pages: List[int] = []
     for part in parts:
         pages.extend(parse_one_pagespec(part, max_pages))
+
     # dedup preserve order
     seen = set()
     uniq: List[int] = []
@@ -145,7 +310,7 @@ def load_selection_mapping(data: bytes, suffix: str):
     return json.loads(text)
 
 
-def _unique_key(prefix: str, name_or_path: str, data_bytes: bytes | None = None) -> str:
+def _unique_key(prefix: str, name_or_path: str, data_bytes: Optional[bytes] = None) -> str:
     base = f"{prefix}:{name_or_path}"
     if data_bytes is not None:
         import hashlib
@@ -164,7 +329,7 @@ def _load_doc_for_preview(data: bytes):
         return None
 
 
-def render_page_image(data: bytes, page_index0: int, zoom: float = 1.5) -> Union[None, bytes]:
+def render_page_image(data: bytes, page_index0: int, zoom: float = 1.5) -> Optional[bytes]:
     """Render one page to PNG. Returns PNG bytes or None."""
     if not _HAVE_FITZ:
         return None
@@ -188,7 +353,8 @@ def embed_pdf_viewer(data: bytes, height: int = 480):
     src = f"data:application/pdf;base64,{b64}#view=FitH"
     st.components.v1.html(
         f'<iframe src="{src}" width="100%" height="{height}" style="border:none;"></iframe>',
-        height=height, scrolling=False
+        height=height,
+        scrolling=False,
     )
 
 
@@ -207,7 +373,6 @@ def page_selector(label: str, pages: int, key: str):
         st.caption("This PDF has 1 page.")
         return st.number_input(label, min_value=1, max_value=1, value=1, step=1, key=key)
 
-    # pages >= 2 → slider is fine
     return st.slider(label, min_value=1, max_value=pages, value=1, step=1, key=key)
 
 
@@ -219,11 +384,11 @@ with st.expander("Page selection syntax help"):
     st.markdown(
         """
 **Syntax (1-based):**
-- Single page: `7`  
-- Range: `3-9`  
-- Open start: `-5` (pages 1..5)  
-- Open end: `4-` (pages 4..last)  
-- Comma list: `1-3,5,10-12`  
+- Single page: `7`
+- Range: `3-9`
+- Open start: `-5` (pages 1..5)
+- Open end: `4-` (pages 4..last)
+- Comma list: `1-3,5,10-12`
 - `all` for all pages
 """
     )
@@ -238,7 +403,12 @@ passwords: Dict[str, str] = {}              # per-file password cache (name/path
 # ----- Upload Tab -----
 with tab_upload:
     uploaded = st.file_uploader("Select one or more PDFs", type=["pdf"], accept_multiple_files=True)
-    mapping_file = st.file_uploader("Optional selections mapping (YAML or JSON)", type=["yaml", "yml", "json"], key="map_upload")
+    mapping_file = st.file_uploader(
+        "Optional selections mapping (YAML or JSON)",
+        type=["yaml", "yml", "json"],
+        key="map_upload"
+    )
+
     uploaded_mapping = {}
     if mapping_file is not None:
         try:
@@ -254,49 +424,52 @@ with tab_upload:
             if not reader:
                 continue
 
+            if is_probably_signed_pdf(data):
+                st.info(f"ℹ️ {f.name} appears to be signed/certified. A working copy may be prepared during merge.")
+
             # ---- Encrypted handling
             pw_key = _unique_key("pw", f.name, data)
             if reader.is_encrypted:
                 st.info(f"🔒 {f.name} is encrypted.")
-                # try empty password first (some PDFs use empty user password)
                 unlocked = False
+
                 try:
                     unlocked = bool(reader.decrypt(""))
+                    if unlocked:
+                        passwords[f.name] = ""
                 except DependencyError:
                     st.error(f"{CRYPTO_HINT}")
                 except Exception:
                     unlocked = False
-                # ask for password if still locked
+
                 if not unlocked:
                     pw = st.text_input(f"Password for {f.name}", type="password", key=pw_key)
                     if pw:
                         unlocked = try_decrypt_reader(reader, pw)
                         if unlocked:
                             passwords[f.name] = pw
+
                 if not unlocked:
                     st.warning("Locked: cannot show page count/preview until decrypted.")
-                    # Allow mapping entry but skip preview/count
                     default_spec = uploaded_mapping.get(f.name, "all") if uploaded_mapping else "all"
                     spec_key = _unique_key("spec", f.name, data)
                     spec = st.text_input(f"Pages for {f.name}", value=str(default_spec), key=spec_key)
-                    # here we still try to keep a spec (will be validated later in table)
                     try:
-                        selections[f.name] = parse_pagespec(spec, 999999)  # dummy max, will be fixed later
+                        selections[f.name] = parse_pagespec(spec, 999999)
                     except Exception:
                         pass
                     file_entries.append((f.name, data))
-                    continue  # proceed to next file
+                    continue
 
-            # ---- Now safe to access pages
             pages = get_num_pages_safe(reader)
             left, right = st.columns([2, 1])
+
             with left:
                 st.markdown(f"**{f.name}** — {pages} pages")
                 default_spec = uploaded_mapping.get(f.name, "all") if uploaded_mapping else "all"
                 spec_key = _unique_key("spec", f.name, data)
                 spec = st.text_input(f"Pages for {f.name}", value=str(default_spec), key=spec_key)
 
-                # Review controls
                 with st.expander("Review this PDF"):
                     if not _HAVE_FITZ:
                         st.info("Install **PyMuPDF** (`pip install pymupdf`) to enable page previews.")
@@ -306,7 +479,8 @@ with tab_upload:
                         if pnum is not None:
                             png = render_page_image(data, int(pnum) - 1, zoom=1.5)
                             if png:
-                                st.image(png, caption=f"{f.name} — Page {pnum}", use_column_width=True)
+                                st.image(png, caption=f"{f.name} — Page {pnum}", use_container_width=True)
+
                         show_full_key = _unique_key("viewer", f.name, data)
                         show_full = st.checkbox("Inline full PDF viewer", value=False, key=show_full_key)
                         if show_full:
@@ -333,7 +507,12 @@ with tab_upload:
 with tab_folder:
     st.write("Enter a local folder path to scan for PDFs. (This only works when you run Streamlit locally.)")
     folder = st.text_input("Folder path", value="")
-    mapping2 = st.file_uploader("Optional selections mapping (YAML or JSON)", type=["yaml", "yml", "json"], key="map_folder")
+    mapping2 = st.file_uploader(
+        "Optional selections mapping (YAML or JSON)",
+        type=["yaml", "yml", "json"],
+        key="map_folder"
+    )
+
     folder_mapping = {}
     if mapping2 is not None:
         try:
@@ -357,31 +536,39 @@ with tab_folder:
                     except Exception as e:
                         st.warning(f"Cannot read {pf}: {e}")
                         continue
+
                     reader = try_open_reader(data)
                     if not reader:
                         continue
 
-                    # Encrypted handling
-                    pw_key = _unique_key("pw", str(pf))
+                    if is_probably_signed_pdf(data):
+                        st.info(f"ℹ️ {pf.name} appears to be signed/certified. A working copy may be prepared during merge.")
+
+                    pw_key = _unique_key("pw", str(pf), data)
                     if reader.is_encrypted:
                         st.info(f"🔒 {pf.name} is encrypted.")
                         unlocked = False
+
                         try:
                             unlocked = bool(reader.decrypt(""))
+                            if unlocked:
+                                passwords[str(pf)] = ""
                         except DependencyError:
                             st.error(f"{CRYPTO_HINT}")
                         except Exception:
                             unlocked = False
+
                         if not unlocked:
                             pw = st.text_input(f"Password for {pf}", type="password", key=pw_key)
                             if pw:
                                 unlocked = try_decrypt_reader(reader, pw)
                                 if unlocked:
                                     passwords[str(pf)] = pw
+
                         if not unlocked:
                             st.warning("Locked: cannot show page count/preview until decrypted.")
                             default_spec = folder_mapping.get(str(pf), folder_mapping.get(pf.name, "all")) if folder_mapping else "all"
-                            spec_key = _unique_key("spec", str(pf))
+                            spec_key = _unique_key("spec", str(pf), data)
                             spec = st.text_input(f"Pages for {pf}", value=str(default_spec), key=spec_key)
                             try:
                                 selections[str(pf)] = parse_pagespec(spec, 999999)
@@ -392,14 +579,17 @@ with tab_folder:
 
                     pages = get_num_pages_safe(reader)
                     st.markdown(f"**{pf}** — {pages} pages")
+
                     default_spec = "all"
                     if folder_mapping:
                         if str(pf) in folder_mapping:
                             default_spec = folder_mapping[str(pf)]
                         elif pf.name in folder_mapping:
                             default_spec = folder_mapping[pf.name]
-                    spec_key = _unique_key("spec", str(pf))  # path is unique
+
+                    spec_key = _unique_key("spec", str(pf), data)
                     spec = st.text_input(f"Pages for {pf}", value=str(default_spec), key=spec_key)
+
                     try:
                         pages_list = parse_pagespec(spec, pages)
                         if not pages_list:
@@ -423,7 +613,6 @@ with tab_review:
                 if not reader:
                     continue
 
-                # If encrypted, try to unlock using cached password (if any)
                 if reader.is_encrypted:
                     pw = passwords.get(name, "")
                     ok = False
@@ -433,11 +622,16 @@ with tab_review:
                         st.error(f"{CRYPTO_HINT}")
                     except Exception:
                         ok = False
+
                     if not ok:
                         st.warning("Locked: enter password in the Upload/Folder tab to enable preview.")
                         continue
 
                 pages = get_num_pages_safe(reader)
+
+                if is_probably_signed_pdf(data):
+                    st.info("This PDF appears signed/certified. Preview is fine, but merge may use a working copy.")
+
                 if not _HAVE_FITZ:
                     st.info("Install **PyMuPDF** (`pip install pymupdf`) to enable page previews.")
                 else:
@@ -448,7 +642,7 @@ with tab_review:
                         if pnum is not None:
                             png = render_page_image(data, int(pnum) - 1, zoom=1.5)
                             if png:
-                                st.image(png, caption=f"{Path(name).name} — Page {pnum}", use_column_width=True)
+                                st.image(png, caption=f"{Path(name).name} — Page {pnum}", use_container_width=True)
                     with c2:
                         st.write("Inline viewer")
                         viewer_key = _unique_key("viewer2", name, data)
@@ -463,13 +657,17 @@ st.markdown("### Page selections (table view)")
 
 if file_entries:
     rows = []
-    # Build rows using current selections and page counts
+    seen_keys = set()
+
     for name, data in file_entries:
+        if name in seen_keys:
+            continue
+        seen_keys.add(name)
+
         reader = try_open_reader(data)
         if not reader:
             continue
 
-        # Handle encryption with cached passwords
         if reader.is_encrypted:
             pw = passwords.get(name, "")
             ok = False
@@ -479,22 +677,21 @@ if file_entries:
                 st.error(CRYPTO_HINT)
             except Exception:
                 ok = False
+
             if not ok:
                 st.warning(f"Locked: cannot compute page count for '{name}'.")
                 continue
 
         max_pages = get_num_pages_safe(reader)
 
-        # Current selection -> string
         if name in selections and selections[name]:
-            # simple version: comma separated list
             spec_str = ",".join(str(p) for p in selections[name])
         else:
             spec_str = "all"
 
         rows.append({
             "PDF Name": Path(name).name,
-            "Key": name,  # internal identifier
+            "Key": name,
             "Pages to be printed": spec_str,
             "Sum pages": max_pages,
         })
@@ -508,7 +705,7 @@ if file_entries:
             hide_index=True,
             key="selection_table",
             column_config={
-                "Key": None,  # hide technical column
+                "Key": None,
                 "PDF Name": st.column_config.TextColumn(disabled=True),
                 "Pages to be printed": st.column_config.TextColumn(
                     help="Use syntax: 1,3-5,all,-3,4-",
@@ -520,10 +717,12 @@ if file_entries:
         if st.button("Apply table selections"):
             new_selections: Dict[str, List[int]] = {}
             had_error = False
+
             for _, row in edited_df.iterrows():
                 key = row["Key"]
                 maxp = int(row["Sum pages"])
                 spec = str(row["Pages to be printed"])
+
                 try:
                     pages_list = parse_pagespec(spec, maxp)
                     if not pages_list:
@@ -534,98 +733,4 @@ if file_entries:
                     new_selections[key] = pages_list
                 except Exception as e:
                     st.error(f"Invalid page spec for {row['PDF Name']}: {e}")
-                    had_error = True
-                    break
-
-            if not had_error:
-                selections.clear()
-                selections.update(new_selections)
-                st.success("Selections updated from table.")
-    else:
-        st.info("No readable PDFs to show in table.")
-else:
-    st.info("No files loaded yet. Upload or select a folder first.")
-
-
-# ----- Merge -----
-st.markdown("---")
-st.subheader("Merge")
-
-colA, colB, colC = st.columns([2, 1, 1])
-with colA:
-    out_name = st.text_input("Output file name", value="merged.pdf")
-with colB:
-    add_bookmarks = st.checkbox("Add bookmarks per source file", value=True)
-with colC:
-    keep_file_order = st.selectbox("File order", ["Upload/scan order (default)", "Alphabetical by name"], index=0)
-
-if file_entries and selections:
-    if keep_file_order == "Alphabetical by name":
-        file_entries = sorted(file_entries, key=lambda t: Path(t[0]).name.lower())
-    if st.button("Merge PDFs"):
-        writer = PdfWriter()
-        for name, data in file_entries:
-            reader = try_open_reader(data)
-            if not reader:
-                continue
-
-            # Unlock with cached password if needed
-            if reader.is_encrypted:
-                pw = passwords.get(name, "")
-                ok = False
-                try:
-                    ok = bool(reader.decrypt(pw))
-                except DependencyError:
-                    st.error(f"{CRYPTO_HINT}")
-                    continue
-                except Exception:
-                    ok = False
-                if not ok:
-                    st.warning(f"Skipping encrypted file '{name}' (no/invalid password).")
-                    continue
-
-            maxp = get_num_pages_safe(reader)
-            if maxp < 1:
-                st.warning(f"Skipping '{name}' — no readable pages.")
-                continue
-
-            wanted = selections.get(name, list(range(1, maxp + 1)))
-            if add_bookmarks and wanted:
-                try:
-                    start_idx = len(writer.pages)
-                    if hasattr(writer, "add_outline_item"):
-                        writer.add_outline_item(Path(name).name, start_idx)
-                    elif hasattr(writer, "add_bookmark"):
-                        writer.add_bookmark(Path(name).name, start_idx)
-                except Exception:
-                    pass
-            for p1 in wanted:
-                idx0 = p1 - 1
-                if 0 <= idx0 < maxp:
-                    writer.add_page(reader.pages[idx0])
-
-        bio = io.BytesIO()
-        writer.write(bio)
-        bio.seek(0)
-        st.success(f"Merged {len(file_entries)} file(s) into '{out_name}'.")
-        st.download_button("Download merged PDF", data=bio, file_name=out_name, mime="application/pdf")
-else:
-    st.info("Add files and valid page selections to enable merging.")
-
-
-# ----- Export selections -----
-if file_entries and selections:
-    mapping_out = {name: ",".join(map(str, pages)) for name, pages in selections.items()}
-    col1, col2 = st.columns(2)
-    with col1:
-        if _HAVE_YAML:
-            if st.button("Export mapping (YAML)"):
-                yaml_bytes = yaml.safe_dump(mapping_out, allow_unicode=True).encode("utf-8")
-                st.download_button("Download selections.yaml", data=yaml_bytes,
-                                   file_name="selections.yaml", mime="text/yaml")
-        else:
-            st.caption("Install **pyyaml** to export YAML mapping.")
-    with col2:
-        json_bytes = json.dumps(mapping_out, ensure_ascii=False, indent=2).encode("utf-8")
-        st.download_button("Download selections.json", data=json_bytes,
-                           file_name="selections.json", mime="application/json")
+                    had_error
